@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────────
+# Site Configuration — University of Moratuwa, Sri Lanka
+# ─────────────────────────────────────────────────────────────
+
+site:
+  name: "University of Moratuwa"
+  latitude: 6.7912          # 6° 47' 28.19" N
+  longitude: 79.9005        # 79° 54' 1.79" E
+  timezone: "Asia/Colombo"  # UTC+5:30
+  elevation_m: 20
+
+# NASA POWER API settings
+nasa_power:
+  base_url: "https://power.larc.nasa.gov/api/temporal/hourly/point"
+  start_date: "20200101"
+  end_date:   "20261231"
+  community: "RE"
+  parameters:
+    - "ALLSKY_SFC_SW_DWN"   # Global Horizontal Irradiance (GHI)   W/m²
+    - "ALLSKY_SFC_SW_DNI"   # Direct Normal Irradiance (DNI)        W/m²
+    - "ALLSKY_SFC_SW_DIFF"  # Diffuse Horizontal Irradiance (DHI)   W/m²
+    - "CLRSKY_SFC_SW_DWN"   # Clear-sky GHI                         W/m²
+    - "T2M"                 # Air temperature at 2 m                °C
+    - "RH2M"                # Relative humidity at 2 m              %
+    - "WS10M"               # Wind speed at 10 m                    m/s
+    - "WD10M"               # Wind direction at 10 m                °
+
+# PV system parameters
+pv_system:
+  capacity_kw: 10.0
+  tilt_deg: 10
+  azimuth_deg: 180
+  module_efficiency: 0.20
+  performance_ratio: 0.80
+  temp_coeff_pmax: -0.0037
+
+# Paths (relative to project root)
+paths:
+  raw_local:     "data/raw/"
+  external_nasa: "data/external/"
+  interim:       "data/interim/"
+  processed:     "data/processed/"
+  synthetic:     "data/synthetic/"
+  figures:       "results/figures/"
+  metrics:       "results/metrics/"
