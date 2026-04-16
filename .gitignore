@@ -1,3 +1,18 @@
+# ── Project-specific ignores ─────────────────────────────────────────────────
+# Large data files and outputs — not committed to git
+data/himawari/
+data/external/*.csv
+data/external/*.gz
+data/interim/
+data/processed/
+data/synthetic/
+data/nsrdb/
+results/
+*.DAT.bz2
+*.tmp
+.DS_Store
+
+# ── Python standard ignores ───────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
