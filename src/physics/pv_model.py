@@ -753,3 +753,259 @@ def load_synthetic(cfg: dict) -> pd.DataFrame:
         f"({df.index.min()} → {df.index.max()})"
     )
     return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Empirical noise model  (NREL/TP-5K00-86459 approach, adapted for 5-min site)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NOISE_PERCENTILES = np.array([1, 10, 20, 40, 50, 60, 80, 90, 99], dtype=float)
+_CLEAR_KT_THRESH   = 0.65   # kt threshold separating clear from cloudy sky
+_MIN_BIN_SAMPLES   = 5      # minimum pts to populate a 2-D CDF bin
+
+
+def _find_nearest_noise_cdf(
+    cloudy_cdf:   dict,
+    irr_b:        float,
+    var_b:        float,
+    irr_bin_size: float,
+    var_bin_size: float,
+    search_steps: int = 3,
+) -> "np.ndarray | None":
+    """Return the nearest populated CDF in the 2-D (irr, var) lookup table."""
+    for di in range(search_steps):
+        for dv in (0.0, var_bin_size, -var_bin_size, var_bin_size * 2, -var_bin_size * 2):
+            key = (irr_b + di * irr_bin_size, round(var_b + dv, 1))
+            if key in cloudy_cdf:
+                return cloudy_cdf[key]
+    return None
+
+
+def build_noise_model(
+    solcast_overlap: pd.DataFrame,
+    actual_pv:       pd.DataFrame,
+    physics_pv:      pd.DataFrame,
+    irr_bin_size:    float = 100.0,
+    var_bin_size:    float = 0.5,
+) -> dict:
+    """
+    Build an empirical noise model from the 1-year overlap period.
+
+    Adapts NREL/TP-5K00-86459 to 5-min tropical site data.
+
+    N5min = (actual_pv_W – physics_pv_W) / P_max_W
+
+    Partitioning
+    ─────────────
+    Clear sky (kt ≥ 0.65):
+        Noise is stable within a day → one daily median N5min per day.
+        Empirical CDF over all clear-sky day medians.
+
+    Cloudy sky (kt < 0.65):
+        5-min noise depends on irradiance level and short-term variability.
+        2-D CDF lookup:  {(irr_bin, var_bin): percentile_array}
+        irr_bin  = ⌊GHI / irr_bin_size⌋ × irr_bin_size  [W/m²]
+        var_bin  = round(log₁₀(rolling_6step_std_GHI) / var_bin_size) × var_bin_size
+
+    Parameters
+    ----------
+    solcast_overlap : 5-min Solcast data with ALLSKY_SFC_SW_DWN_cal and
+                      CLRSKY_SFC_SW_DWN_cal (or clearsky_ghi).
+    actual_pv       : 5-min actual PV measurements (must contain _PV_POWER_COL).
+    physics_pv      : output of simulate_pv() on the same overlap period.
+    irr_bin_size    : W/m² bin width for the cloudy CDF (default 100).
+    var_bin_size    : log₁₀ bin width for the variability axis (default 0.5).
+
+    Returns
+    -------
+    dict
+        clear_cdf    – np.ndarray  percentile values for clear-sky daily bias
+        cloudy_cdf   – dict {(irr_bin, var_bin): np.ndarray}
+        percentiles  – np.ndarray  (1,10,20,40,50,60,80,90,99)
+        p_max_w      – float  system capacity (99th pct actual daytime PV)
+        irr_bin_size – float
+        var_bin_size – float
+    """
+    logger.info("Building empirical noise model from overlap period …")
+
+    ghi = solcast_overlap["ALLSKY_SFC_SW_DWN_cal"].clip(lower=0)
+    if "CLRSKY_SFC_SW_DWN_cal" in solcast_overlap.columns:
+        clrsky = solcast_overlap["CLRSKY_SFC_SW_DWN_cal"].replace(0, np.nan).clip(lower=1)
+    else:
+        clrsky = solcast_overlap["clearsky_ghi"].replace(0, np.nan).clip(lower=1)
+
+    kt       = (ghi / clrsky).clip(0, 1.2).fillna(0)
+    actual_w = actual_pv[_PV_POWER_COL].clip(lower=0)
+    phys_w   = physics_pv["pv_ac_W"].clip(lower=0)
+
+    daytime_actual = actual_w[ghi >= 50].dropna()
+    p_max_w = float(np.percentile(daytime_actual, 99)) if len(daytime_actual) > 0 else 100_000.0
+    logger.info(f"  P_max (99th pct actual daytime) = {p_max_w / 1000:.1f} kW")
+
+    df = pd.DataFrame({"ghi": ghi, "kt": kt, "actual": actual_w, "physics": phys_w}).dropna()
+    df = df[df["ghi"] >= 50]
+    df["N5min"] = (df["actual"] - df["physics"]) / p_max_w
+
+    rolling_std = ghi.rolling(window=6, min_periods=3).std().clip(lower=0.1)
+    log10_var   = np.log10(rolling_std).clip(-2.0, 3.0)
+
+    # ── Clear-sky CDF: daily median bias ─────────────────────────────────────
+    clear_df = df[df["kt"] >= _CLEAR_KT_THRESH]
+    if len(clear_df) >= 10:
+        daily_med = clear_df["N5min"].resample("D").median().dropna()
+        clear_cdf = np.percentile(daily_med.values, _NOISE_PERCENTILES)
+    else:
+        logger.warning("  Clear-sky: insufficient data — CDF zeroed.")
+        clear_cdf = np.zeros(len(_NOISE_PERCENTILES))
+    logger.info(
+        f"  Clear-sky: {len(clear_df):,} pts ({int(clear_df['kt'].ge(_CLEAR_KT_THRESH).mean()*100)}%)"
+        f"  CDF range [{clear_cdf[0]:.3f}, {clear_cdf[-1]:.3f}]"
+    )
+
+    # ── Cloudy-sky 2-D CDF: irradiance × log₁₀ variability ──────────────────
+    cloudy_df = df[df["kt"] < _CLEAR_KT_THRESH].copy()
+    cloudy_df["log10_var"] = log10_var.loc[cloudy_df.index]
+    cloudy_df["irr_bin"]   = (
+        (cloudy_df["ghi"] / irr_bin_size).apply(np.floor) * irr_bin_size
+    ).astype(int)
+    cloudy_df["var_bin"]   = (
+        (cloudy_df["log10_var"] / var_bin_size).round() * var_bin_size
+    ).round(1)
+
+    cloudy_cdf: dict = {}
+    for (irr_b, var_b), group in cloudy_df.groupby(["irr_bin", "var_bin"], observed=True):
+        if len(group) >= _MIN_BIN_SAMPLES:
+            cloudy_cdf[(float(irr_b), float(var_b))] = np.percentile(
+                group["N5min"].values, _NOISE_PERCENTILES
+            )
+    logger.info(
+        f"  Cloudy-sky: {len(cloudy_df):,} pts → {len(cloudy_cdf)} (irr, var) bins populated"
+    )
+
+    return {
+        "clear_cdf":    clear_cdf,
+        "cloudy_cdf":   cloudy_cdf,
+        "percentiles":  _NOISE_PERCENTILES,
+        "p_max_w":      p_max_w,
+        "irr_bin_size": irr_bin_size,
+        "var_bin_size": var_bin_size,
+    }
+
+
+def apply_synthetic_noise(
+    synthetic_pv: pd.DataFrame,
+    solcast_df:   pd.DataFrame,
+    noise_model:  dict,
+    actual_index: "pd.DatetimeIndex | None" = None,
+    random_seed:  int = 42,
+) -> pd.DataFrame:
+    """
+    Apply site-matched empirical noise to synthetic PV labels.
+
+    Uses distributions from build_noise_model().  Noise is injected only
+    into non-overlap rows (the overlap year uses actual PV in the ML pipeline).
+
+    Clear-sky days receive one sampled bias broadcast across all 5-min slots.
+    Cloudy-sky timestamps each receive independently sampled noise from the
+    (irr_bin, var_bin) CDF — matching the NREL 2-D cloudy-sky approach.
+
+    Parameters
+    ----------
+    synthetic_pv : pd.DataFrame   output of simulate_pv()
+    solcast_df   : pd.DataFrame   full Solcast data (for irradiance context)
+    noise_model  : dict           from build_noise_model()
+    actual_index : DatetimeIndex  overlap rows excluded from noise injection
+    random_seed  : int
+
+    Returns
+    -------
+    pd.DataFrame  copy of synthetic_pv with noisy pv_ac_W.
+    """
+    rng    = np.random.default_rng(random_seed)
+    out    = synthetic_pv.copy()
+    pv_arr = out["pv_ac_W"].values.astype(float)
+
+    # ── Masks ─────────────────────────────────────────────────────────────────
+    if actual_index is not None:
+        non_overlap = ~synthetic_pv.index.isin(actual_index)
+    else:
+        non_overlap = np.ones(len(synthetic_pv), dtype=bool)
+
+    is_day    = (synthetic_pv["solar_elevation"] > 0).values
+    non_ov_np = non_overlap.values if hasattr(non_overlap, "values") else np.asarray(non_overlap)
+    apply_arr = non_ov_np & is_day
+
+    # ── Align Solcast irradiance to synthetic index ───────────────────────────
+    ghi_full = (
+        solcast_df["ALLSKY_SFC_SW_DWN_cal"].clip(lower=0)
+        .reindex(synthetic_pv.index).ffill().fillna(0.0)
+    )
+    clrsky_col = (
+        "CLRSKY_SFC_SW_DWN_cal" if "CLRSKY_SFC_SW_DWN_cal" in solcast_df.columns
+        else "clearsky_ghi"
+    )
+    clrsky_full = (
+        solcast_df[clrsky_col].replace(0, np.nan).clip(lower=1)
+        .reindex(synthetic_pv.index).ffill().fillna(1.0)
+    )
+
+    kt_full        = (ghi_full / clrsky_full).clip(0, 1.2).fillna(0)
+    rolling_std    = ghi_full.rolling(window=6, min_periods=3).std().clip(lower=0.1).fillna(0.1)
+    log10_var_full = np.log10(rolling_std).clip(-2.0, 3.0)
+
+    clear_cdf    = noise_model["clear_cdf"]
+    cloudy_cdf   = noise_model["cloudy_cdf"]
+    percs        = noise_model["percentiles"]
+    p_max_w      = noise_model["p_max_w"]
+    irr_bin_size = noise_model["irr_bin_size"]
+    var_bin_size = noise_model["var_bin_size"]
+
+    noise_arr = np.zeros(len(synthetic_pv))
+
+    # ── 1. Clear-sky: one daily bias per day, broadcast to 5-min slots ───────
+    clear_arr = apply_arr & (kt_full.values >= _CLEAR_KT_THRESH)
+    if clear_arr.any():
+        clear_dates  = synthetic_pv.index[clear_arr].normalize().unique()
+        u_vals       = rng.uniform(0, 100, size=len(clear_dates))
+        daily_biases = np.interp(u_vals, percs, clear_cdf)
+        date_map     = pd.Series(daily_biases, index=clear_dates)
+
+        all_norm = synthetic_pv.index.normalize()
+        mapped   = date_map.reindex(all_norm[clear_arr]).values
+        noise_arr[clear_arr] = np.where(np.isnan(mapped), 0.0, mapped)
+
+    # ── 2. Cloudy-sky: per-5-min noise from 2-D CDF (vectorised by bin) ──────
+    cloudy_arr = apply_arr & (kt_full.values < _CLEAR_KT_THRESH)
+    if cloudy_arr.any():
+        ghi_c    = ghi_full.values[cloudy_arr]
+        var_c    = log10_var_full.values[cloudy_arr]
+        irr_bins = (np.floor(ghi_c / irr_bin_size) * irr_bin_size).astype(int)
+        var_bins = np.round(np.round(var_c / var_bin_size) * var_bin_size, 1)
+
+        cloudy_noise = np.zeros(cloudy_arr.sum())
+        tmp = pd.DataFrame({"irr_bin": irr_bins, "var_bin": var_bins})
+        for (irr_b, var_b), grp in tmp.groupby(["irr_bin", "var_bin"], observed=True):
+            cdf_vals = _find_nearest_noise_cdf(
+                cloudy_cdf, float(irr_b), float(var_b), irr_bin_size, var_bin_size
+            )
+            if cdf_vals is not None:
+                u = rng.uniform(0, 100, size=len(grp))
+                cloudy_noise[grp.index.values] = np.interp(u, percs, cdf_vals)
+        noise_arr[cloudy_arr] = cloudy_noise
+
+    # ── Apply noise: pv_noisy = clip(pv_clean × (1 + noise), 0, 1.1 × P_max) ─
+    apply_pos         = np.where(apply_arr)[0]
+    pv_arr[apply_pos] = np.clip(
+        pv_arr[apply_pos] * (1.0 + noise_arr[apply_pos]),
+        0.0,
+        p_max_w * 1.1,
+    )
+    pv_arr[~is_day] = 0.0
+    out["pv_ac_W"]  = pv_arr
+
+    noisy_vals = noise_arr[apply_pos]
+    logger.info(
+        f"  Noise injected: {len(apply_pos):,} non-overlap daytime rows  "
+        f"(mean|N|={np.abs(noisy_vals).mean():.3f}  std={noisy_vals.std():.3f})"
+    )
+    return out
